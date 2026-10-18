@@ -62,28 +62,19 @@ def health_check():
 
 @app.route('/download', methods=['POST'])
 def download_video():
-    """קבלת בקשת ההורדה מ-Make או מקור חיצוני"""
-    logging.info("=== התקבלה בקשת POST חדשה בנתיב /download ===")
-    
     data = request.get_json(silent=True)
-    if not data:
-        logging.error("הבקשה נכשלה: לא התקבל payload בפורמט JSON תקין.")
-        return jsonify({"error": "No JSON payload or invalid JSON"}), 400
+    if not data or not data.get('url'):
+        return jsonify({"error": "No URL provided"}), 400
 
     url = data.get('url')
-    if not url:
-        logging.error("הבקשה נכשלה: השדה 'url' חסר בתוך ה-JSON.")
-        return jsonify({"error": "No URL provided in JSON"}), 400
-
-    logging.info(f"התקבל קישור לעיבוד: {url}")
-
-    # הפעלת תהליך ההורדה וההעלאה בתהליכון נפרד (Thread) כדי להחזיר תשובה מיידית ב-HTTP 200
+    
+    # הפעלת ההורדה ברקע
     thread = threading.Thread(target=process_and_upload, args=(url,))
     thread.daemon = True
     thread.start()
 
-    logging.info("תהליכון הטיפול ברקע הופעל בהצלחה. מחזיר תשובה ללקוח.")
-    return jsonify({"status": "Processing started", "url": url}), 200
+    # החזרת אישור מיידי ל-Make לפני תהליך ההורדה
+    return jsonify({"status": "success", "message": "הבקשה התקבלה!"}), 200
 
 def process_and_upload(url):
     """תהליך הורדת הסרטון והעלאתו ל-Google Drive"""
