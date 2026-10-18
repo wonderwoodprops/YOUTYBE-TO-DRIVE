@@ -77,7 +77,7 @@ def download_video():
     return jsonify({"status": "success", "message": "הבקשה התקבלה!"}), 200
 
 def process_and_upload(url):
-    """תהליך הורדת הסרטון והעלאתו ל-Google Drive עם הגדרות יציבות"""
+    """תהליך הורדת הסרטון והעלאתו ל-Google Drive עם הגדרות יציבות ועמידות"""
     filename = None
     try:
         logging.info(f"[הרצה ברקע] מתחיל הורדת סרטון מיוטיוב: {url}")
@@ -85,17 +85,19 @@ def process_and_upload(url):
         output_dir = 'downloads'
         os.makedirs(output_dir, exist_ok=True)
 
+        # הגדרות מתקדמות לייצוב ההורדה ועקיפת חסימות בוטים של יוטיוב
         ydl_opts = {
             'format': 'bv*+ba/b',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
-            # הגדרות מתקדמות לייצוב ההורדה ועקיפת מגבלות זיהוי
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android', 'web'],
                 }
-            }
+            },
+            'socket_timeout': 30,
+            'retries': 5,
         }
 
         # 1. הורדה באמצעות yt-dlp
@@ -129,7 +131,7 @@ def process_and_upload(url):
             if status:
                 logging.info(f"[הרצה ברקע] התקדמות העלאה: {int(status.progress() * 100)}%")
 
-        logging.info(f"[הרצה ברקע] הקובץ הועלה בהצלחה ל-Google Drive!")
+        logging.info(f"[הרצה ברקע] הקובץ הועלה בהצלחה ל-Google Drive! מזהה קובץ: {response.get('id')}")
 
     except Exception as e:
         logging.error(f"[הרצה ברקע] שגיאה קריטית בתהליך העיבוד: {str(e)}")
