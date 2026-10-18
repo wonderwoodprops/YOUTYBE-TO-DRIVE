@@ -178,6 +178,9 @@ def cookies_to_netscape(cookies):
             exp = int(float(c.get("expirationDate") or 0))
         except (TypeError, ValueError):
             exp = 0
+        if exp <= 0:
+            # קוקיז סשן (בלי תוקף): expiry=0 עלול להיחשב כפג תוקף ולהיזרק בטעינה
+            exp = int(time.time()) + 86400
         prefix = "#HttpOnly_" if c.get("httpOnly") else ""
         lines.append("\t".join([
             prefix + domain,
@@ -339,6 +342,7 @@ def download_with_fallbacks(url, job_dir, extra_cookies=None):
                     info = ydl.extract_info(url, download=True)
                 path = find_output_file(info, job_dir)
                 if path:
+                    log.info("הורדה הצליחה עם cookies=%s, clients=%s", mode_name, label)
                     return path, clients, cookie_path
                 last_error = RuntimeError("ההורדה הסתיימה אך לא נמצא קובץ")
                 break
