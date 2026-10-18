@@ -40,6 +40,21 @@ VIDEO_FORMAT = os.environ.get(
 )
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")    # אופציונלי: שרת bgutil PO-token
 COOKIES_SRC = "/tmp/yt_cookies_src.txt"
+COOKIES_MIN = "/tmp/yt_cookies_min.txt"
+
+# כתוביות: מוטמעות בתוך קובץ ה-mp4 (soft subtitles), ובנוסף נשמר .srt נפרד ב-Drive
+DOWNLOAD_SUBS = os.environ.get("DOWNLOAD_SUBS", "1") == "1"
+UPLOAD_SRT = os.environ.get("UPLOAD_SRT", "1") == "1"
+SUB_LANGS = [l.strip() for l in os.environ.get("SUB_LANGS", "he,iw").split(",") if l.strip()]
+
+# קוקיז הכרחיים בלבד. נשמטים הקוקיז המתחלפים (PSIDTS / PSIDCC / BUCKET) שהם הסיבה
+# הנפוצה לפקיעת תוקף, ויוטיוב מנפיקה אותם מחדש בעצמה.
+ESSENTIAL_COOKIES = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "LOGIN_INFO", "PREF",
+}
 WORK_ROOT = os.environ.get("WORK_DIR", "/tmp/downloads")
 
 ALLOWED_HOSTS = {
@@ -82,6 +97,15 @@ def _normalize_cookies(raw: str) -> str:
         text = text.replace("\\n", "\n")
     if "\\t" in text:
         text = text.replace("\\t", "\t")
+    # אם הטאבים הפכו לרווחים בהעתקה - משחזר את הפורמט (7 שדות מופרדים בטאב)
+    fixed = []
+    for line in text.split("\n"):
+        if line.strip() and "\t" not in line and (not line.startswith("#") or line.startswith("#HttpOnly_")):
+            parts = line.split(None, 6)
+            if len(parts) == 7:
+                line = "\t".join(parts)
+        fixed.append(line)
+    text = "\n".join(fixed)
     if not text.startswith("# Netscape HTTP Cookie File") and not text.startswith("# HTTP Cookie File"):
         text = "# Netscape HTTP Cookie File\n" + text
     return text + "\n"
@@ -95,10 +119,23 @@ def setup_cookies_file():
     if not raw:
         log.warning("לא הוגדרו קוקיז (YOUTUBE_COOKIES / YOUTUBE_COOKIES_B64). משרת ענן סביר שיוטיוב יחסום.")
         return
+    normalized = _normalize_cookies(raw)
     with open(COOKIES_SRC, "w", encoding="utf-8") as f:
-        f.write(_normalize_cookies(raw))
-    lines = [l for l in open(COOKIES_SRC, encoding="utf-8") if l.strip() and not l.startswith("#")]
-    log.info("קובץ קוקיז נוצר (%d רשומות).", len(lines))
+        f.write(normalized)
+
+    minimal = ["# Netscape HTTP Cookie File"]
+    total = 0
+    for line in normalized.split("\n"):
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            total += 1
+            if parts[5] in ESSENTIAL_COOKIES:
+                minimal.append(line)
+    with open(COOKIES_MIN, "w", encoding="utf-8") as f:
+        f.write("\n".join(minimal) + "\n")
+    log.info("קובץ קוקיז נוצר (%d רשומות, מתוכן %d הכרחיות לגיבוי).", total, len(minimal) - 1)
+    if total == 0:
+        log.warning("לא זוהו רשומות קוקיז תקינות - בדוק את פורמט המשתנה.")
 
 
 def startup_checks():
@@ -162,7 +199,7 @@ def upload_to_drive(path: str) -> str:
 # ---------------------------------------------------------------------------
 # הורדה
 # ---------------------------------------------------------------------------
-def build_ydl_opts(job_dir: str, player_clients):
+def build_ydl_opts(job_dir: str, player_clients, cookie_src=None):
     opts = {
         "format": VIDEO_FORMAT,
         "merge_output_format": "mp4",
@@ -192,11 +229,24 @@ def build_ydl_opts(job_dir: str, player_clients):
     if PROXY:
         opts["proxy"] = PROXY
 
-    if os.path.exists(COOKIES_SRC):
+    if cookie_src and os.path.exists(cookie_src):
         # עותק לכל משימה: yt-dlp כותב חזרה לקובץ הקוקיז, ואסור שמשימות ידרסו זו את זו
         job_cookies = os.path.join(job_dir, "cookies.txt")
-        shutil.copyfile(COOKIES_SRC, job_cookies)
+        shutil.copyfile(cookie_src, job_cookies)
         opts["cookiefile"] = job_cookies
+
+    if DOWNLOAD_SUBS and SUB_LANGS:
+        opts.update({
+            "writesubtitles": True,          # כתוביות ידניות (עדיפות)
+            "writeautomaticsub": True,       # אוטומטיות אם אין ידניות
+            "subtitleslangs": SUB_LANGS,
+            "subtitlesformat": "srt/vtt/best",
+            "postprocessors": [
+                {"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"},
+                # הטמעה בתוך ה-mp4; already_have_subtitle שומר את קובצי ה-srt להעלאה נפרדת
+                {"key": "FFmpegEmbedSubtitle", "already_have_subtitle": True},
+            ],
+        })
     return opts
 
 
@@ -209,33 +259,41 @@ def find_output_file(info, job_dir):
         pass
     candidates = [
         os.path.join(job_dir, f) for f in os.listdir(job_dir)
-        if not f.endswith((".txt", ".part", ".ytdl"))
+        if not f.endswith((".txt", ".part", ".ytdl", ".srt", ".vtt"))
     ]
     return max(candidates, key=os.path.getsize) if candidates else None
 
 
 def download_with_fallbacks(url: str, job_dir: str):
     last_error = None
+    # קודם כל הקוקיז המלאים, ואם יש בעיית אימות - רק ההכרחיים
+    cookie_modes = [(n, p) for n, p in (("full", COOKIES_SRC), ("minimal", COOKIES_MIN)) if os.path.exists(p)]
+    if not cookie_modes:
+        cookie_modes = [("none", None)]
+
     for i, clients in enumerate(PLAYER_CLIENT_ATTEMPTS, start=1):
         label = ",".join(clients) if clients else "default"
-        log.info("ניסיון %d/%d (clients=%s)", i, len(PLAYER_CLIENT_ATTEMPTS), label)
-        try:
-            with yt_dlp.YoutubeDL(build_ydl_opts(job_dir, clients)) as ydl:
-                info = ydl.extract_info(url, download=True)
-            path = find_output_file(info, job_dir)
-            if path:
-                return path
-            last_error = RuntimeError("ההורדה הסתיימה אך לא נמצא קובץ")
-        except DownloadError as e:
-            msg = str(e).lower()
-            last_error = e
-            if any(p in msg for p in PERMANENT_ERRORS):
-                log.error("שגיאה קבועה, אין טעם לנסות שוב: %s", e)
-                raise
-            if any(a in msg for a in AUTH_ERRORS):
-                log.warning("יוטיוב דורש אימות/חוסם IP (clients=%s). בדוק קוקיז חדשים או פרוקסי.", label)
-            else:
+        for mode_name, cookie_path in cookie_modes:
+            log.info("ניסיון %d/%d (clients=%s, cookies=%s)", i, len(PLAYER_CLIENT_ATTEMPTS), label, mode_name)
+            try:
+                with yt_dlp.YoutubeDL(build_ydl_opts(job_dir, clients, cookie_path)) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                path = find_output_file(info, job_dir)
+                if path:
+                    return path
+                last_error = RuntimeError("ההורדה הסתיימה אך לא נמצא קובץ")
+                break
+            except DownloadError as e:
+                msg = str(e).lower()
+                last_error = e
+                if any(p in msg for p in PERMANENT_ERRORS):
+                    log.error("שגיאה קבועה, אין טעם לנסות שוב: %s", e)
+                    raise
+                if any(a in msg for a in AUTH_ERRORS):
+                    log.warning("בעיית אימות (cookies=%s, clients=%s) - עובר לאפשרות הבאה.", mode_name, label)
+                    continue  # מנסה את סט הקוקיז הבא עם אותו לקוח
                 log.warning("הורדה נכשלה (clients=%s): %s", label, e)
+                break  # שגיאה אחרת: עובר ללקוח הבא
         time.sleep(3 * i)
     raise last_error or RuntimeError("ההורדה נכשלה")
 
@@ -266,8 +324,23 @@ def process_and_upload(job_id: str, url: str):
         size_mb = os.path.getsize(path) / 1024 / 1024
         log.info("[%s] הורדה הושלמה: %s (%.1f MB)", job_id, os.path.basename(path), size_mb)
 
-        set_job(job_id, status="uploading", filename=os.path.basename(path))
+        srt_files = sorted(
+            os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(".srt")
+        )
+        if DOWNLOAD_SUBS:
+            if srt_files:
+                log.info("[%s] נמצאו כתוביות: %s", job_id, [os.path.basename(s) for s in srt_files])
+            else:
+                log.info("[%s] לא נמצאו כתוביות בעברית לסרטון הזה.", job_id)
+
+        set_job(job_id, status="uploading", filename=os.path.basename(path), subtitles=bool(srt_files))
         file_id = upload_to_drive(path)
+        if UPLOAD_SRT:
+            for srt in srt_files:
+                try:
+                    upload_to_drive(srt)
+                except Exception as e:
+                    log.warning("[%s] העלאת %s נכשלה: %s", job_id, os.path.basename(srt), e)
         set_job(job_id, status="done", drive_file_id=file_id)
         log.info("[%s] הועלה ל-Drive: %s", job_id, file_id)
     except HttpError as e:
