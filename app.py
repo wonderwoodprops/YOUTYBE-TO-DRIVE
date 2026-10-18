@@ -27,6 +27,7 @@ logging.basicConfig(
 log = logging.getLogger("app")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024  # עד 1MB לבקשה
 
 # ---------------------------------------------------------------------------
 # הגדרות (הכל ניתן לשינוי ממשתני סביבה ב-Railway)
@@ -162,6 +163,43 @@ startup_checks()
 # ---------------------------------------------------------------------------
 # Google Drive
 # ---------------------------------------------------------------------------
+def cookies_to_netscape(cookies):
+    """ממיר רשימת קוקיז בפורמט chrome.cookies לקובץ Netscape. מחזיר None אם אין תקינים."""
+    if not isinstance(cookies, list):
+        return None
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies[:300]:
+        if not isinstance(c, dict):
+            continue
+        domain, name, value = str(c.get("domain", "")), str(c.get("name", "")), str(c.get("value", ""))
+        if not name or not (domain.endswith("youtube.com") or domain.endswith("google.com")):
+            continue
+        if any(ch in (domain + name + value) for ch in "\t\r\n"):
+            continue
+        try:
+            exp = int(float(c.get("expirationDate") or 0))
+        except (TypeError, ValueError):
+            exp = 0
+        prefix = "#HttpOnly_" if c.get("httpOnly") else ""
+        lines.append("\t".join([
+            prefix + domain,
+            "TRUE" if domain.startswith(".") else "FALSE",
+            str(c.get("path") or "/"),
+            "TRUE" if c.get("secure") else "FALSE",
+            str(exp), name, value,
+        ]))
+    return "\n".join(lines) + "\n" if len(lines) > 1 else None
+
+
+def filter_essential(netscape_text: str) -> str:
+    out = ["# Netscape HTTP Cookie File"]
+    for line in netscape_text.split("\n"):
+        parts = line.split("\t")
+        if len(parts) >= 7 and parts[5] in ESSENTIAL_COOKIES:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def get_drive_service():
     creds = Credentials(
         token=None,
@@ -264,10 +302,20 @@ def find_output_file(info, job_dir):
     return max(candidates, key=os.path.getsize) if candidates else None
 
 
-def download_with_fallbacks(url: str, job_dir: str):
+def download_with_fallbacks(url: str, job_dir: str, extra_cookies: str = None):
     last_error = None
     # קודם כל הקוקיז המלאים, ואם יש בעיית אימות - רק ההכרחיים
-    cookie_modes = [(n, p) for n, p in (("full", COOKIES_SRC), ("minimal", COOKIES_MIN)) if os.path.exists(p)]
+    cookie_modes = []
+    if extra_cookies:
+        # קוקיז טריים שנשלחו עם הבקשה (מהתוסף) - עדיפות ראשונה
+        req_full = os.path.join(job_dir, "req_cookies_full.txt")
+        req_min = os.path.join(job_dir, "req_cookies_min.txt")
+        with open(req_full, "w", encoding="utf-8") as f:
+            f.write(extra_cookies)
+        with open(req_min, "w", encoding="utf-8") as f:
+            f.write(filter_essential(extra_cookies))
+        cookie_modes += [("request-full", req_full), ("request-min", req_min)]
+    cookie_modes += [(n, p) for n, p in (("full", COOKIES_SRC), ("minimal", COOKIES_MIN)) if os.path.exists(p)]
     if not cookie_modes:
         cookie_modes = [("none", None)]
 
@@ -314,13 +362,13 @@ def notify_callback(job_id):
         log.warning("שליחת callback נכשלה: %s", e)
 
 
-def process_and_upload(job_id: str, url: str):
+def process_and_upload(job_id: str, url: str, extra_cookies: str = None):
     job_dir = os.path.join(WORK_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
     try:
         set_job(job_id, status="downloading")
         log.info("[%s] מתחיל הורדה: %s", job_id, url)
-        path = download_with_fallbacks(url, job_dir)
+        path = download_with_fallbacks(url, job_dir, extra_cookies)
         size_mb = os.path.getsize(path) / 1024 / 1024
         log.info("[%s] הורדה הושלמה: %s (%.1f MB)", job_id, os.path.basename(path), size_mb)
 
@@ -396,6 +444,10 @@ def download_video():
     if not valid_youtube_url(url):
         return jsonify({"error": "Only YouTube URLs are allowed"}), 400
 
+    extra_cookies = cookies_to_netscape(data.get("cookies"))
+    if data.get("cookies"):
+        log.info("התקבלו קוקיז עם הבקשה (תקינים: %s).", bool(extra_cookies))
+
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         if len(jobs) >= MAX_JOBS_KEPT:
@@ -403,7 +455,7 @@ def download_video():
                 jobs.pop(old, None)
         jobs[job_id] = {"status": "queued", "url": url}
 
-    executor.submit(process_and_upload, job_id, url)
+    executor.submit(process_and_upload, job_id, url, extra_cookies)
     return jsonify({"status": "success", "message": "הבקשה התקבלה!", "job_id": job_id}), 202
 
 
