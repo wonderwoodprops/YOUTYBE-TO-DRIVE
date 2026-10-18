@@ -93,7 +93,6 @@ def process_and_upload(url):
         output_dir = 'downloads'
         os.makedirs(output_dir, exist_ok=True)
 
-        # הגדרות יציבות להורדה ישירה עם לקוח iOS לעקיפת מגבלות ו-429
         ydl_opts = {
             'format': 'b',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
@@ -107,6 +106,11 @@ def process_and_upload(url):
             'socket_timeout': 60,
             'retries': 10,
         }
+
+        # החזרת השימוש בקובץ הקוקיז לאימות מול יוטיוב
+        if os.path.exists('cookies.txt'):
+            ydl_opts['cookiefile'] = 'cookies.txt'
+            logging.info("[הרצה ברקע] משתמש בקובץ cookies.txt לאימות מול יוטיוב.")
 
         # 1. הורדה באמצעות yt-dlp
         logging.info("[הרצה ברקע] מפעיל את yt-dlp...")
