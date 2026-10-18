@@ -32,6 +32,14 @@ def check_environment_variables():
     else:
         logging.info("כל משתני הסביבה הנדרשים נמצאו בהצלחה.")
 
+def setup_cookies_file():
+    """הגדרת קובץ קוקיז אם קיים במשתנה סביבה"""
+    cookies_content = os.environ.get('YOUTUBE_COOKIES')
+    if cookies_content:
+        with open('cookies.txt', 'w', encoding='utf-8') as f:
+            f.write(cookies_content)
+        logging.info("קובץ Cookies נוצר בהצלחה ממשתנה הסביבה.")
+
 def get_drive_service():
     """חיבור לשירות Google Drive API"""
     try:
@@ -77,7 +85,7 @@ def download_video():
     return jsonify({"status": "success", "message": "הבקשה התקבלה!"}), 200
 
 def process_and_upload(url):
-    """תהליך הורדת הסרטון והעלאתו ל-Google Drive עם הגדרות יציבות ועמידות"""
+    """תהליך הורדת הסרטון והעלאתו ל-Google Drive עם תמיכה בקוקיז"""
     filename = None
     try:
         logging.info(f"[הרצה ברקע] מתחיל הורדת סרטון מיוטיוב: {url}")
@@ -85,7 +93,6 @@ def process_and_upload(url):
         output_dir = 'downloads'
         os.makedirs(output_dir, exist_ok=True)
 
-        # הגדרות מתקדמות לייצוב ההורדה ועקיפת חסימות בוטים של יוטיוב
         ydl_opts = {
             'format': 'bv*+ba/b',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
@@ -99,6 +106,11 @@ def process_and_upload(url):
             'socket_timeout': 30,
             'retries': 5,
         }
+
+        # אם קיים קובץ קוקיז, נשלב אותו בהגדרות כדי לעקוף חסימות בוטים
+        if os.path.exists('cookies.txt'):
+            ydl_opts['cookiefile'] = 'cookies.txt'
+            logging.info("[הרצה ברקע] משתמש בקובץ cookies.txt לאימות מול יוטיוב.")
 
         # 1. הורדה באמצעות yt-dlp
         logging.info("[הרצה ברקע] מפעיל את yt-dlp...")
@@ -149,6 +161,7 @@ def process_and_upload(url):
 if __name__ == '__main__':
     logging.info("מפעיל את השרת...")
     check_environment_variables()
+    setup_cookies_file()
     port = int(os.environ.get('PORT', 8080))
     logging.info(f"השרת מאזין בפורט: {port}")
     app.run(host='0.0.0.0', port=port)
