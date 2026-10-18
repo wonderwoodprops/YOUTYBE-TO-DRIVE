@@ -85,7 +85,7 @@ def download_video():
     return jsonify({"status": "success", "message": "הבקשה התקבלה!"}), 200
 
 def process_and_upload(url):
-    """תהליך הורדת הסרטון והעלאתו ל-Google Drive עם תמיכה בקוקיז"""
+    """תהליך הורדת הסרטון והעלאתו ל-Google Drive"""
     filename = None
     try:
         logging.info(f"[הרצה ברקע] מתחיל הורדת סרטון מיוטיוב: {url}")
@@ -93,21 +93,17 @@ def process_and_upload(url):
         output_dir = 'downloads'
         os.makedirs(output_dir, exist_ok=True)
 
+        # הגדרות יציבות להורדה ישירה שמתאימה לעבודה עם קוקיז בענן
         ydl_opts = {
-            'format': 'bv*+ba/b',
+            'format': 'best',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                }
-            },
             'socket_timeout': 30,
             'retries': 5,
         }
 
-        # אם קיים קובץ קוקיז, נשלב אותו בהגדרות כדי לעקוף חסימות בוטים
+        # אם קיים קובץ קוקיז, נשלב אותו בהגדרות
         if os.path.exists('cookies.txt'):
             ydl_opts['cookiefile'] = 'cookies.txt'
             logging.info("[הרצה ברקע] משתמש בקובץ cookies.txt לאימות מול יוטיוב.")
