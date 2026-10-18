@@ -94,7 +94,7 @@ def process_and_upload(url):
         os.makedirs(output_dir, exist_ok=True)
 
         ydl_opts = {
-            'format': 'b',
+            'format': 'best',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
