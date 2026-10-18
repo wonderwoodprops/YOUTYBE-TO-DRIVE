@@ -150,6 +150,6 @@ def process_and_upload(url):
 if __name__ == '__main__':
     logging.info("מפעיל את השרת...")
     check_environment_variables()
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8080))
     logging.info(f"השרת מאזין בפורט: {port}")
     app.run(host='0.0.0.0', port=port)
