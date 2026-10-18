@@ -1,5 +1,8 @@
-Flask
-yt-dlp
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
+flask>=3.0
+gunicorn>=22.0
+requests>=2.31
+yt-dlp[default]
+google-api-python-client>=2.100
+google-auth>=2.23
+# אופציונלי - ספק PO Token (דורש גם להריץ שרת bgutil, ראה README):
+# bgutil-ytdlp-pot-provider
