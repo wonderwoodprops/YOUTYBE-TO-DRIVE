@@ -93,12 +93,16 @@ def process_and_upload(url):
         output_dir = 'downloads'
         os.makedirs(output_dir, exist_ok=True)
 
-        # הגדרות יציבות להורדה ישירה שמתאימה לעבודה עם קוקיז בענן
         ydl_opts = {
             'format': 'best',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web'],
+                }
+            },
             'socket_timeout': 30,
             'retries': 5,
         }
