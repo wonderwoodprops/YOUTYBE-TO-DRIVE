@@ -3,6 +3,7 @@ import hmac
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,14 @@ SUB_LANGS = [l.strip() for l in os.environ.get("SUB_LANGS", "he,iw").split(",") 
 SUB_ATTEMPTS = int(os.environ.get("SUB_ATTEMPTS", "4"))
 SUB_INITIAL_DELAY = float(os.environ.get("SUB_INITIAL_DELAY", "10"))  # המתנה לפני הניסיון הראשון
 SUB_BACKOFF = float(os.environ.get("SUB_BACKOFF", "30"))              # 30, 60, 120... שניות
+
+# תיאור הסרטון מיוטיוב נשמר כקובץ טקסט לצד הסרטון
+UPLOAD_DESCRIPTION = os.environ.get("UPLOAD_DESCRIPTION", "1") == "1"
+
+# העתקת קבצים מ-Google Drive: ברירת מחדל - רק קבצי וידאו
+DRIVE_ALLOW_ANY = os.environ.get("DRIVE_ALLOW_ANY", "0") == "1"
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".3gp", ".ts")
+DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
 
 ESSENTIAL_COOKIES = {
     "SID", "HSID", "SSID", "APISID", "SAPISID",
@@ -112,6 +121,7 @@ class CaptureLogger:
     def __init__(self):
         self._log = logging.getLogger("yt-dlp")
         self.rate_limited = False
+        self.cookies_invalid = False
 
     def debug(self, msg):
         (self._log.debug if msg.startswith("[debug] ") else self._log.info)(msg)
@@ -120,6 +130,11 @@ class CaptureLogger:
         self._log.info(msg)
 
     def warning(self, msg):
+        if "cookies are no longer valid" in msg:
+            if not self.cookies_invalid:  # ההודעה חוזרת עשרות פעמים - מתעדים פעם אחת
+                self._log.warning("הקוקיז אינם תקינים (עברו rotation בדפדפן).")
+            self.cookies_invalid = True
+            return
         if is_rate_limited(msg):
             self.rate_limited = True
         self._log.warning(msg)
@@ -265,6 +280,128 @@ def upload_to_drive(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# העתקת קובץ מ-Google Drive ציבורי לדרייב שלך (העתקה בצד של גוגל, בלי שיתוף)
+# ---------------------------------------------------------------------------
+def parse_drive_link(url):
+    """מחזיר (file_id, resource_key) מקישור דרייב, או None אם זה לא קישור לקובץ."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    if p.scheme not in ("http", "https") or (p.hostname or "").lower() not in DRIVE_HOSTS:
+        return None
+    if re.search(r"/(drive/)?folders/|/drive/u/\d+/folders/", p.path):
+        return None  # תיקיות לא נתמכות
+    m = re.search(r"/(?:file|document|spreadsheets|presentation)/(?:u/\d+/)?d/([\w-]{20,})", p.path)
+    fid = m.group(1) if m else None
+    q = dict(kv.split("=", 1) for kv in (p.query or "").split("&") if "=" in kv)
+    if not fid:
+        fid = q.get("id") if re.fullmatch(r"[\w-]{20,}", q.get("id", "")) else None
+    if not fid:
+        return None
+    return fid, q.get("resourcekey")
+
+
+def _drive_exec(request_obj, file_id, resource_key):
+    if resource_key:
+        request_obj.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
+    return request_obj.execute(num_retries=3)
+
+
+def _http_reason(e: HttpError) -> str:
+    try:
+        return e.error_details[0].get("reason", "") if e.error_details else ""
+    except Exception:
+        return ""
+
+
+def copy_drive_file(file_id, resource_key, job_dir):
+    """מעתיק קובץ לתיקיית היעד. מחזיר (id חדש, שם, שיטה: copy/download)."""
+    service = get_drive_service()
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+
+    try:
+        meta = _drive_exec(
+            service.files().get(fileId=file_id, fields="id,name,mimeType,size", supportsAllDrives=True),
+            file_id, resource_key,
+        )
+    except HttpError as e:
+        if e.resp.status == 404:
+            raise RuntimeError(
+                "DRIVE_NOT_FOUND: הקובץ לא נמצא או שאינו נגיש. בדוק שהקישור ציבורי, "
+                "ושהטוקן של גוגל כולל הרשאת drive מלאה (לא drive.file)."
+            )
+        raise
+
+    mime, name = meta.get("mimeType", ""), meta.get("name", file_id)
+    if mime == "application/vnd.google-apps.folder":
+        raise RuntimeError("DRIVE_UNSUPPORTED: זו תיקייה, לא קובץ.")
+    if not DRIVE_ALLOW_ANY and not (mime.startswith("video/") or name.lower().endswith(VIDEO_EXTS)):
+        raise RuntimeError(f"DRIVE_NOT_VIDEO: הקובץ אינו וידאו ({mime}). לאישור כל סוג קובץ: DRIVE_ALLOW_ANY=1")
+    log.info("קובץ דרייב: %s (%s, %s bytes)", name, mime, meta.get("size", "?"))
+
+    body = {}
+    if folder_id:
+        body["parents"] = [folder_id]
+    try:
+        copied = _drive_exec(
+            service.files().copy(fileId=file_id, body=body, fields="id,name", supportsAllDrives=True),
+            file_id, resource_key,
+        )
+        return copied["id"], copied.get("name", name), "copy"
+    except HttpError as e:
+        reason = _http_reason(e)
+        log.warning("copy נכשל (%s, %s) - מנסה הורדה והעלאה.", e.resp.status, reason)
+        if reason == "storageQuotaExceeded":
+            raise RuntimeError("DRIVE_QUOTA: אין מקום פנוי בדרייב שלך.")
+        if e.resp.status not in (403, 400):
+            raise
+
+    # גיבוי: הורדה דרך ה-API והעלאה מחדש (כשהעתקה ישירה חסומה אבל קריאה מותרת)
+    from googleapiclient.http import MediaIoBaseDownload
+    dest = os.path.join(job_dir, re.sub(r"[\\/:*?\"<>|]", "_", name))
+    try:
+        req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        if resource_key:
+            req.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
+        with open(dest, "wb") as fh:
+            dl = MediaIoBaseDownload(fh, req, chunksize=32 * 1024 * 1024)
+            done = False
+            while not done:
+                _, done = dl.next_chunk(num_retries=5)
+    except HttpError as e:
+        if _http_reason(e) in ("downloadQuotaExceeded", "cannotDownloadFile", "forbidden") or e.resp.status == 403:
+            raise RuntimeError("DRIVE_BLOCKED: בעל הקובץ חסם העתקה/הורדה, או שחרגה מכסת ההורדות של הקובץ.")
+        raise
+    return upload_to_drive(dest), name, "download"
+
+
+# ---------------------------------------------------------------------------
+# תיאור הסרטון כקובץ טקסט
+# ---------------------------------------------------------------------------
+def write_description_file(info, video_path):
+    """כותב קובץ טקסט עם כותרת, ערוץ, תאריך ותיאור. None אם אין תיאור."""
+    info = info or {}
+    desc = (info.get("description") or "").strip()
+    if not desc:
+        return None
+    d = info.get("upload_date") or ""
+    if re.fullmatch(r"\d{8}", d):
+        d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    header = [
+        f"כותרת: {info.get('title') or ''}",
+        f"ערוץ: {info.get('uploader') or info.get('channel') or ''}",
+        f"תאריך העלאה: {d}",
+        f"קישור: {info.get('webpage_url') or ''}",
+        "", "-" * 40, "",
+    ]
+    path = os.path.splitext(video_path)[0] + ".txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(header) + desc + "\n")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # הורדת הסרטון (בלי כתוביות)
 # ---------------------------------------------------------------------------
 def build_ydl_opts(job_dir, player_clients, cookie_src=None, logger=None):
@@ -315,9 +452,11 @@ def find_output_file(info, job_dir):
 
 
 def download_with_fallbacks(url, job_dir, extra_cookies=None):
-    """מחזיר (נתיב הקובץ, player_clients שהצליחו, קובץ הקוקיז שהצליח)."""
+    """מחזיר (נתיב הקובץ, player_clients שהצליחו, קובץ הקוקיז שהצליח, info של yt-dlp)."""
     last_error = None
 
+    # (שם, נתיב, קבוצה). קבוצה = מקור הקוקיז; אם yt-dlp מדווח שהקוקיז של מקור "לא תקינים"
+    # (עברו rotation) מדלגים על כל הקבוצה, כי ניסיון חוזר עם אותם קוקיז הוא בזבוז.
     cookie_modes = []
     if extra_cookies:
         req_full = os.path.join(job_dir, "req_cookies_full.txt")
@@ -326,32 +465,45 @@ def download_with_fallbacks(url, job_dir, extra_cookies=None):
             f.write(extra_cookies)
         with open(req_min, "w", encoding="utf-8") as f:
             f.write(filter_essential(extra_cookies))
-        cookie_modes += [("request-full", req_full), ("request-min", req_min)]
-    cookie_modes += [(n, p) for n, p in (("full", COOKIES_SRC), ("minimal", COOKIES_MIN)) if os.path.exists(p)]
+        cookie_modes += [("request-full", req_full, "request"), ("request-min", req_min, "request")]
+    cookie_modes += [(n, p, "env") for n, p in (("full", COOKIES_SRC), ("minimal", COOKIES_MIN)) if os.path.exists(p)]
     if not cookie_modes:
-        cookie_modes = [("none", None)]
+        cookie_modes = [("none", None, "none")]
+
+    dead_groups = set()
+    saw_429 = False
 
     for i, clients in enumerate(PLAYER_CLIENT_ATTEMPTS, start=1):
         label = ",".join(clients) if clients else "default"
         rate_limited = False
-        for mode_name, cookie_path in cookie_modes:
+        tried = False
+        for mode_name, cookie_path, group in cookie_modes:
+            if group in dead_groups:
+                continue
+            tried = True
             log.info("ניסיון %d/%d (clients=%s, cookies=%s)", i, len(PLAYER_CLIENT_ATTEMPTS), label, mode_name)
             throttle()
+            cap = CaptureLogger()
             try:
-                with yt_dlp.YoutubeDL(build_ydl_opts(job_dir, clients, cookie_path)) as ydl:
+                with yt_dlp.YoutubeDL(build_ydl_opts(job_dir, clients, cookie_path, cap)) as ydl:
                     info = ydl.extract_info(url, download=True)
                 path = find_output_file(info, job_dir)
                 if path:
                     log.info("הורדה הצליחה עם cookies=%s, clients=%s", mode_name, label)
-                    return path, clients, cookie_path
+                    return path, clients, cookie_path, info
                 last_error = RuntimeError("ההורדה הסתיימה אך לא נמצא קובץ")
                 break
             except DownloadError as e:
                 msg = str(e).lower()
                 last_error = e
+                saw_429 = saw_429 or cap.rate_limited
                 if any(p in msg for p in PERMANENT_ERRORS):
                     log.error("שגיאה קבועה, אין טעם לנסות שוב: %s", e)
                     raise
+                if cap.cookies_invalid:
+                    dead_groups.add(group)
+                    log.warning("הקוקיז ממקור '%s' לא תקינים - מדלג על כל הסט שלהם.", group)
+                    continue
                 if is_rate_limited(msg):
                     rate_limited = True
                     log.warning("429 מול יוטיוב (clients=%s) - ממתין לפני ניסיון נוסף.", label)
@@ -361,8 +513,21 @@ def download_with_fallbacks(url, job_dir, extra_cookies=None):
                     continue
                 log.warning("הורדה נכשלה (clients=%s): %s", label, e)
                 break
-        pause = (30 * i + random.uniform(0, 10)) if rate_limited else 3 * i
+        if not tried:
+            break  # כל מקורות הקוקיז נפסלו - אין טעם לעבור ללקוחות נוספים
+        pause = (30 * i + random.uniform(0, 10)) if (rate_limited or saw_429) else 3 * i
         time.sleep(pause)
+
+    # הודעות שגיאה ברורות (מופיעות ב-/status וב-callback)
+    if dead_groups and all(g in dead_groups for _, _, g in cookie_modes):
+        raise RuntimeError(
+            "COOKIES_INVALID: כל הקוקיז שנוסו אינם תקינים (עברו rotation). "
+            "שלח קוקיז טריים מהתוסף (וודא ש-Make מעביר את השדה cookies) או ייצא קוקיז חדשים."
+        )
+    if saw_429:
+        raise RuntimeError(
+            "RATE_LIMITED: יוטיוב מחזירה 429 ל-IP של השרת. נדרש פרוקסי residential (YTDLP_PROXY) או המתנה."
+        )
     raise last_error or RuntimeError("ההורדה נכשלה")
 
 
@@ -475,13 +640,33 @@ def notify_callback(job_id):
         log.warning("שליחת callback נכשלה: %s", e)
 
 
+def process_drive_copy(job_id, drive_ref):
+    job_dir = os.path.join(WORK_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        file_id, resource_key = drive_ref
+        set_job(job_id, status="copying")
+        new_id, name, method = copy_drive_file(file_id, resource_key, job_dir)
+        set_job(job_id, status="done", drive_file_id=new_id, filename=name, method=method)
+        log.info("[%s] הועתק לדרייב שלך (%s): %s", job_id, method, new_id)
+    except HttpError as e:
+        log.error("[%s] שגיאת Google Drive: %s", job_id, e)
+        set_job(job_id, status="error", error=f"Drive: {e}"[:500])
+    except Exception as e:
+        log.error("[%s] שגיאה: %s", job_id, e)
+        set_job(job_id, status="error", error=str(e)[:500])
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        notify_callback(job_id)
+
+
 def process_and_upload(job_id, url, extra_cookies=None):
     job_dir = os.path.join(WORK_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
     try:
         set_job(job_id, status="downloading")
         log.info("[%s] מתחיל הורדה: %s", job_id, url)
-        path, clients, cookie_path = download_with_fallbacks(url, job_dir, extra_cookies)
+        path, clients, cookie_path, info = download_with_fallbacks(url, job_dir, extra_cookies)
         log.info("[%s] הורדה הושלמה: %s (%.1f MB)", job_id, os.path.basename(path),
                  os.path.getsize(path) / 1024 / 1024)
 
@@ -506,13 +691,29 @@ def process_and_upload(job_id, url, extra_cookies=None):
                 subs_state = reason  # unavailable / rate_limited / failed
             log.info("[%s] מצב כתוביות: %s", job_id, subs_state)
 
-        set_job(job_id, status="uploading", filename=os.path.basename(path), subtitles=subs_state)
+        desc_path, desc_state = None, "disabled"
+        if UPLOAD_DESCRIPTION:
+            try:
+                desc_path = write_description_file(info, path)
+                desc_state = "uploaded" if desc_path else "empty"
+            except Exception as e:  # תיאור לעולם לא מפיל את המשימה
+                log.warning("[%s] יצירת קובץ התיאור נכשלה: %s", job_id, e)
+                desc_state = "failed"
+
+        set_job(job_id, status="uploading", filename=os.path.basename(path),
+                subtitles=subs_state, description=desc_state)
         file_id = upload_to_drive(path)
         if srt_to_upload:
             try:
                 upload_to_drive(srt_to_upload)
             except Exception as e:
                 log.warning("[%s] העלאת srt נכשלה: %s", job_id, e)
+        if desc_path:
+            try:
+                upload_to_drive(desc_path)
+            except Exception as e:
+                log.warning("[%s] העלאת קובץ התיאור נכשלה: %s", job_id, e)
+                set_job(job_id, description="failed")
         set_job(job_id, status="done", drive_file_id=file_id)
         log.info("[%s] הועלה ל-Drive: %s", job_id, file_id)
     except HttpError as e:
@@ -553,6 +754,7 @@ def health_check():
         "proxy": bool(PROXY),
         "js_runtime": bool(shutil.which("deno") or shutil.which("node")),
         "subtitles": DOWNLOAD_SUBS,
+        "description": UPLOAD_DESCRIPTION,
     }), 200
 
 
@@ -565,21 +767,30 @@ def download_video():
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
-    if not valid_youtube_url(url):
-        return jsonify({"error": "Only YouTube URLs are allowed"}), 400
+    drive_ref = parse_drive_link(url)
+    is_youtube = valid_youtube_url(url)
+    if not is_youtube and not drive_ref:
+        return jsonify({"error": "Only YouTube or Google Drive file URLs are allowed"}), 400
 
-    extra_cookies = cookies_to_netscape(data.get("cookies"))
-    if data.get("cookies"):
-        log.info("התקבלו קוקיז עם הבקשה (תקינים: %s).", bool(extra_cookies))
+    extra_cookies = None
+    if is_youtube:
+        extra_cookies = cookies_to_netscape(data.get("cookies"))
+        if data.get("cookies"):
+            log.info("התקבלו קוקיז עם הבקשה (תקינים: %s).", bool(extra_cookies))
+        else:
+            log.warning("הבקשה הגיעה בלי קוקיז - בדוק שב-Make מועבר השדה cookies.")
 
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         if len(jobs) >= MAX_JOBS_KEPT:
             for old in list(jobs)[: MAX_JOBS_KEPT // 3]:
                 jobs.pop(old, None)
-        jobs[job_id] = {"status": "queued", "url": url}
+        jobs[job_id] = {"status": "queued", "url": url, "source": "youtube" if is_youtube else "drive"}
 
-    executor.submit(process_and_upload, job_id, url, extra_cookies)
+    if is_youtube:
+        executor.submit(process_and_upload, job_id, url, extra_cookies)
+    else:
+        executor.submit(process_drive_copy, job_id, drive_ref)
     return jsonify({"status": "success", "message": "הבקשה התקבלה!", "job_id": job_id}), 202
 
 
