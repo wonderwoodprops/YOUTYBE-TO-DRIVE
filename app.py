@@ -65,6 +65,11 @@ DRIVE_ALLOW_ANY = os.environ.get("DRIVE_ALLOW_ANY", "0") == "1"
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".3gp", ".ts")
 DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
 
+# MEGA: מורד עם megatools (megadl) לדיסק זמני ומעלה ל-Drive
+MEGA_HOSTS = {"mega.nz", "mega.co.nz"}
+MEGA_TIMEOUT = int(os.environ.get("MEGA_TIMEOUT", "10800"))   # שניות להורדה אחת (ברירת מחדל 3 שעות)
+MEGA_PROXY = os.environ.get("MEGA_PROXY", "")                 # אופציונלי, נפרד מפרוקסי יוטיוב (חוסך תעבורה יקרה)
+
 ESSENTIAL_COOKIES = {
     "SID", "HSID", "SSID", "APISID", "SAPISID",
     "__Secure-1PSID", "__Secure-3PSID",
@@ -232,8 +237,9 @@ def startup_checks():
     if missing:
         log.warning("משתני סביבה חסרים: %s", ", ".join(missing))
     log.info("yt-dlp גרסה: %s", yt_dlp.version.__version__)
-    log.info("ffmpeg: %s | deno: %s | node: %s",
-             bool(shutil.which("ffmpeg")), bool(shutil.which("deno")), bool(shutil.which("node")))
+    log.info("ffmpeg: %s | deno: %s | node: %s | megadl: %s",
+             bool(shutil.which("ffmpeg")), bool(shutil.which("deno")), bool(shutil.which("node")),
+             bool(shutil.which("megadl")))
     if not shutil.which("deno") and not shutil.which("node"):
         log.warning("אין JS runtime (deno/node) - yt-dlp לא יוכל לפתור את אתגרי יוטיוב.")
     if not API_KEY:
@@ -399,6 +405,106 @@ def write_description_file(info, video_path):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(header) + desc + "\n")
     return path
+
+
+# ---------------------------------------------------------------------------
+# MEGA (קובץ בודד)
+# ---------------------------------------------------------------------------
+def mega_host(url):
+    try:
+        return (urlparse(url).hostname or "").lower().removeprefix("www.") in MEGA_HOSTS
+    except Exception:
+        return False
+
+
+def parse_mega_link(url):
+    """מחזיר קישור קנוני https://mega.nz/file/ID#KEY, או None (גם לתיקיות)."""
+    if not mega_host(url):
+        return None
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return None
+    frag = p.fragment or ""
+    m = re.fullmatch(r"/(?:file|embed)/([\w-]{8})", p.path)
+    if m and re.fullmatch(r"[\w-]{16,}", frag):
+        return f"https://mega.nz/file/{m.group(1)}#{frag}"
+    m = re.fullmatch(r"!([\w-]{8})!([\w-]{16,})", frag)       # פורמט ישן: #!ID!KEY
+    if p.path in ("", "/") and m:
+        return f"https://mega.nz/file/{m.group(1)}#{m.group(2)}"
+    return None
+
+
+def redact_url(url):
+    """המפתח שאחרי # הוא סוד: לא נכנס ללוגים, ל-/status או ל-callback."""
+    if "#" in url and "mega." in url:
+        return url.split("#", 1)[0] + "#***"
+    return url
+
+
+def run_megadl(url, job_dir):
+    if not shutil.which("megadl"):
+        raise RuntimeError("MEGA_UNAVAILABLE: megatools לא מותקן בשרת (נדרש להריץ דרך ה-Dockerfile).")
+    key = url.split("#", 1)[1]
+    cmd = ["megadl", "--no-progress", "--path", job_dir]
+    if MEGA_PROXY:
+        cmd += ["--proxy", MEGA_PROXY]
+    cmd.append(url)
+
+    out = ""
+    for attempt in range(1, 4):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=MEGA_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"MEGA_TIMEOUT: ההורדה לא הסתיימה תוך {MEGA_TIMEOUT} שניות.")
+        out = (((r.stdout or "") + "\n" + (r.stderr or "")).strip()).replace(key, "***")
+        if r.returncode == 0:
+            return
+        low = out.lower()
+        log.warning("megadl נכשל (ניסיון %d/3): %s", attempt, out[-300:])
+        if any(s in low for s in ("quota", "509", "overquota", "bandwidth limit")):
+            raise RuntimeError("MEGA_QUOTA: חרגת ממכסת ההורדה של MEGA ל-IP הזה. נסה שוב בעוד כמה שעות, "
+                               "או הגדר MEGA_PROXY.")
+        if any(s in low for s in ("not found", "enoent", "no such file", "does not exist", "removed")):
+            raise RuntimeError("MEGA_NOT_FOUND: הקובץ לא נמצא או שהוסר.")
+        if any(s in low for s in ("ekey", "decrypt", "invalid key", "invalid link", "bad link")):
+            raise RuntimeError("MEGA_BAD_LINK: הקישור או המפתח שלו לא תקינים.")
+        if attempt < 3:
+            time.sleep(20 * attempt)
+    raise RuntimeError("MEGA_FAILED: " + out[-300:])
+
+
+def find_mega_file(job_dir):
+    files = [os.path.join(job_dir, f) for f in os.listdir(job_dir)
+             if not f.startswith(".megatmp") and not f.endswith(".megatmp") and
+             os.path.isfile(os.path.join(job_dir, f))]
+    return max(files, key=os.path.getsize) if files else None
+
+
+def process_mega(job_id, url):
+    job_dir = os.path.join(WORK_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        set_job(job_id, status="downloading")
+        log.info("[%s] מתחיל הורדה מ-MEGA: %s", job_id, redact_url(url))
+        run_megadl(url, job_dir)
+        path = find_mega_file(job_dir)
+        if not path:
+            raise RuntimeError("MEGA_FAILED: ההורדה הסתיימה אך לא נמצא קובץ.")
+        log.info("[%s] הורדה הושלמה: %s (%.1f MB)", job_id, os.path.basename(path),
+                 os.path.getsize(path) / 1024 / 1024)
+        set_job(job_id, status="uploading", filename=os.path.basename(path))
+        file_id = upload_to_drive(path)
+        set_job(job_id, status="done", drive_file_id=file_id)
+        log.info("[%s] הועלה ל-Drive: %s", job_id, file_id)
+    except HttpError as e:
+        log.error("[%s] שגיאת Google Drive: %s", job_id, e)
+        set_job(job_id, status="error", error=f"Drive: {e}"[:500])
+    except Exception as e:
+        log.error("[%s] שגיאה: %s", job_id, e)
+        set_job(job_id, status="error", error=str(e)[:500])
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        notify_callback(job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +861,7 @@ def health_check():
         "js_runtime": bool(shutil.which("deno") or shutil.which("node")),
         "subtitles": DOWNLOAD_SUBS,
         "description": UPLOAD_DESCRIPTION,
+        "mega": bool(shutil.which("megadl")),
     }), 200
 
 
@@ -768,9 +875,13 @@ def download_video():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
     drive_ref = parse_drive_link(url)
+    mega_url = parse_mega_link(url)
     is_youtube = valid_youtube_url(url)
-    if not is_youtube and not drive_ref:
-        return jsonify({"error": "Only YouTube or Google Drive file URLs are allowed"}), 400
+    if mega_host(url) and not mega_url:
+        return jsonify({"error": "MEGA: only single-file links with a key (mega.nz/file/ID#KEY) are supported"}), 400
+    if not is_youtube and not drive_ref and not mega_url:
+        return jsonify({"error": "Only YouTube, Google Drive or MEGA file URLs are allowed"}), 400
+    source = "youtube" if is_youtube else "mega" if mega_url else "drive"
 
     extra_cookies = None
     if is_youtube:
@@ -785,10 +896,12 @@ def download_video():
         if len(jobs) >= MAX_JOBS_KEPT:
             for old in list(jobs)[: MAX_JOBS_KEPT // 3]:
                 jobs.pop(old, None)
-        jobs[job_id] = {"status": "queued", "url": url, "source": "youtube" if is_youtube else "drive"}
+        jobs[job_id] = {"status": "queued", "url": redact_url(url), "source": source}
 
     if is_youtube:
         executor.submit(process_and_upload, job_id, url, extra_cookies)
+    elif mega_url:
+        executor.submit(process_mega, job_id, mega_url)
     else:
         executor.submit(process_drive_copy, job_id, drive_ref)
     return jsonify({"status": "success", "message": "הבקשה התקבלה!", "job_id": job_id}), 202
