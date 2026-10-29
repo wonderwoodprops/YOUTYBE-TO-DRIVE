@@ -1,10 +1,13 @@
 import base64
 import hmac
+import json
 import logging
 import os
 import random
+import ipaddress
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -12,11 +15,12 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
 
 import requests
 import yt_dlp
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -51,7 +55,8 @@ MIN_REQUEST_GAP = float(os.environ.get("MIN_REQUEST_GAP", "6"))
 
 # כתוביות: מורדות בבקשה נפרדת, אחרי הסרטון, עם backoff. כשל בהן לא פוגע בסרטון.
 DOWNLOAD_SUBS = os.environ.get("DOWNLOAD_SUBS", "1") == "1"
-UPLOAD_SRT = os.environ.get("UPLOAD_SRT", "1") == "1"   # גם srt נפרד לצד הסרטון המוטמע
+# הכתוביות מועלות כקובץ srt נפרד אחרי הסרטון. הטמעה בתוך הסרטון שבדרייב (דורשת העלאה חוזרת שלו):
+EMBED_SUBS = os.environ.get("EMBED_SUBS", "0") == "1"
 SUB_LANGS = [l.strip() for l in os.environ.get("SUB_LANGS", "he,iw").split(",") if l.strip()]
 SUB_ATTEMPTS = int(os.environ.get("SUB_ATTEMPTS", "4"))
 SUB_INITIAL_DELAY = float(os.environ.get("SUB_INITIAL_DELAY", "10"))  # המתנה לפני הניסיון הראשון
@@ -69,6 +74,18 @@ DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
 MEGA_HOSTS = {"mega.nz", "mega.co.nz"}
 MEGA_TIMEOUT = int(os.environ.get("MEGA_TIMEOUT", "10800"))   # שניות להורדה אחת (ברירת מחדל 3 שעות)
 MEGA_PROXY = os.environ.get("MEGA_PROXY", "")                 # אופציונלי, נפרד מפרוקסי יוטיוב (חוסך תעבורה יקרה)
+
+# סריקת דפים והורדה כללית (דורשים API_KEY מוגדר, כי השרת פונה לכתובות שהמשתמש מזין)
+GENERIC_ENABLED = os.environ.get("ALLOW_GENERIC", "1") == "1"
+GENERIC_PROXY = os.environ.get("GENERIC_PROXY", "")           # אופציונלי, למשל פרוקסי ישראלי לאתרים עם חסימה גיאוגרפית
+UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+SCAN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "Accept-Language": "he,en;q=0.8",
+}
+STATIC_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".css", ".js", ".ico", ".woff", ".woff2", ".ttf", ".pdf", ".zip", ".xml", ".json")
+SOCIAL_RE = re.compile(r"(facebook|twitter|x\.com|instagram|whatsapp|t\.me|linkedin|tiktok|pinterest)\.", re.I)
+LIKELY_VIDEO_RE = re.compile(r"(vod|video|watch|episode|season|player|clip|stream|live|movie|series|שידור|וידאו|סרטון|פרק|עונה|צפו|צפייה|סדרה|תוכנית)", re.I)
 
 ESSENTIAL_COOKIES = {
     "SID", "HSID", "SSID", "APISID", "SAPISID",
@@ -285,6 +302,30 @@ def upload_to_drive(path: str) -> str:
     return response["id"]
 
 
+def update_drive_file(file_id: str, path: str) -> None:
+    """מחליף את תוכן קובץ קיים בדרייב (אותו מזהה)."""
+    service = get_drive_service()
+    media = MediaFileUpload(path, chunksize=16 * 1024 * 1024, resumable=True)
+    req = service.files().update(fileId=file_id, media_body=media, fields="id", supportsAllDrives=True)
+    response = None
+    while response is None:
+        _, response = req.next_chunk(num_retries=5)
+
+
+def parse_flag(value, default):
+    """בוליאני גמיש מהבקשה (true/false/1/0/"true"); ערך חסר או ריק -> ברירת המחדל."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    v = str(value).strip().lower()
+    if v == "":
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
 # העתקת קובץ מ-Google Drive ציבורי לדרייב שלך (העתקה בצד של גוגל, בלי שיתוף)
 # ---------------------------------------------------------------------------
@@ -473,6 +514,99 @@ def run_megadl(url, job_dir):
     raise RuntimeError("MEGA_FAILED: " + out[-300:])
 
 
+MEGA_API_ERRORS = {
+    -9: "MEGA_NOT_FOUND: MEGA עצמה מאשרת (קוד -9) שהקובץ לא קיים: הוא נמחק, פג תוקפו, או שמזהה הקישור שגוי.",
+    -16: "MEGA_BLOCKED: הקובץ נחסם על ידי MEGA (הסרה עקב תלונה או הפרת תנאי שימוש).",
+    -11: "MEGA_NO_ACCESS: אין גישה לקובץ (הקישור בוטל או הוגבל).",
+    -17: "MEGA_QUOTA: חרגת ממכסת ההורדה של MEGA ל-IP הזה. נסה שוב בעוד כמה שעות או הגדר MEGA_PROXY.",
+    -18: "MEGA_TEMP: הקובץ אינו זמין זמנית ב-MEGA. נסה שוב מאוחר יותר.",
+}
+
+
+def _b64url_decode(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _mega_proxies():
+    return {"http": MEGA_PROXY, "https": MEGA_PROXY} if MEGA_PROXY else None
+
+
+def mega_api_info(handle):
+    """שואל את ה-API של MEGA ישירות (בלי המפתח). מחזיר dict אם הקובץ קיים, או int (קוד שגיאה)."""
+    r = requests.post("https://g.api.mega.co.nz/cs", params={"id": random.randint(1, 10**9)},
+                      json=[{"a": "g", "g": 1, "ssl": 1, "p": handle}],
+                      timeout=30, proxies=_mega_proxies())
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        data = data[0] if data else -3
+    if isinstance(data, dict) and "g" not in data and isinstance(data.get("e"), int):
+        return data["e"]
+    return data
+
+
+def mega_python_download(url, job_dir):
+    """הורדה ופענוח ישירות מול MEGA (גיבוי כש-megatools נכשל). בודק קודם אם הקובץ בכלל קיים."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    handle, key_b64 = url.rsplit("/", 1)[1].split("#", 1)
+    try:
+        raw = _b64url_decode(key_b64)
+    except Exception:
+        raw = b""
+    if len(raw) != 32:
+        raise RuntimeError("MEGA_BAD_LINK: המפתח בקישור אינו תקין או שנחתך.")
+
+    info = mega_api_info(handle)
+    log.info("תשובת API של MEGA עבור %s: %s", handle,
+             info if isinstance(info, int) else f"קובץ קיים ({info.get('s', '?')} bytes)")
+    if isinstance(info, int):
+        raise RuntimeError(MEGA_API_ERRORS.get(info, f"MEGA_FAILED: MEGA החזירה קוד שגיאה {info}."))
+
+    k = [int.from_bytes(raw[i:i + 4], "big") for i in range(0, 32, 4)]
+    aes_key = b"".join((k[i] ^ k[i + 4]).to_bytes(4, "big") for i in range(4))
+    nonce = k[4].to_bytes(4, "big") + k[5].to_bytes(4, "big")
+
+    name = handle
+    try:
+        dec = Cipher(algorithms.AES(aes_key), modes.CBC(b"\0" * 16)).decryptor()
+        attrs = dec.update(_b64url_decode(info["at"])) + dec.finalize()
+        if attrs.startswith(b"MEGA"):
+            name = json.loads(attrs[4:].rstrip(b"\0").decode("utf-8")).get("n") or handle
+    except Exception as e:
+        log.warning("פענוח שם הקובץ נכשל, משתמש במזהה: %s", e)
+    name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name)[:200] or handle
+    dest = os.path.join(job_dir, name)
+
+    size = int(info.get("s") or 0)
+    ctr = Cipher(algorithms.AES(aes_key), modes.CTR(nonce + b"\0" * 8)).decryptor()
+    written = 0
+    with requests.get(info["g"], stream=True, timeout=(30, 120), proxies=_mega_proxies()) as resp:
+        if resp.status_code == 509:
+            raise RuntimeError(MEGA_API_ERRORS[-17])
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(ctr.update(chunk))
+                    written += len(chunk)
+    if size and written != size:
+        raise RuntimeError(f"MEGA_FAILED: ההורדה נקטעה ({written} מתוך {size} bytes).")
+
+
+def mega_fetch(url, job_dir):
+    """קודם megatools; אם נכשל (לא בגלל מכסה/timeout) - בדיקה והורדה ישירות מול ה-API."""
+    if shutil.which("megadl"):
+        try:
+            run_megadl(url, job_dir)
+            return
+        except RuntimeError as e:
+            if str(e).startswith(("MEGA_QUOTA", "MEGA_TIMEOUT")):
+                raise
+            log.warning("megatools נכשל (%s) - בודק מול ה-API של MEGA.", str(e)[:80])
+    mega_python_download(url, job_dir)
+
+
 def find_mega_file(job_dir):
     files = [os.path.join(job_dir, f) for f in os.listdir(job_dir)
              if not f.startswith(".megatmp") and not f.endswith(".megatmp") and
@@ -486,7 +620,7 @@ def process_mega(job_id, url):
     try:
         set_job(job_id, status="downloading")
         log.info("[%s] מתחיל הורדה מ-MEGA: %s", job_id, redact_url(url))
-        run_megadl(url, job_dir)
+        mega_fetch(url, job_dir)
         path = find_mega_file(job_dir)
         if not path:
             raise RuntimeError("MEGA_FAILED: ההורדה הסתיימה אך לא נמצא קובץ.")
@@ -766,69 +900,404 @@ def process_drive_copy(job_id, drive_ref):
         notify_callback(job_id)
 
 
-def process_and_upload(job_id, url, extra_cookies=None):
+def process_and_upload(job_id, url, extra_cookies=None, want_subs=None, want_desc=None):
+    """
+    סדר העבודה: 1) הורדת הסרטון 2) העלאתו לדרייב 3) תיאור (אם התבקש) 4) כתוביות (אם התבקשו).
+    כשל בתיאור/כתוביות לעולם לא פוגע בסרטון שכבר הועלה.
+    """
+    if want_subs is None:
+        want_subs = DOWNLOAD_SUBS
+    if want_desc is None:
+        want_desc = UPLOAD_DESCRIPTION
+    want_subs = bool(want_subs and SUB_LANGS)
+    want_desc = bool(want_desc)
+
     job_dir = os.path.join(WORK_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
     try:
-        set_job(job_id, status="downloading")
-        log.info("[%s] מתחיל הורדה: %s", job_id, url)
+        set_job(job_id, status="downloading",
+                subtitles="pending" if want_subs else "disabled",
+                description="pending" if want_desc else "disabled")
+        log.info("[%s] מתחיל הורדה: %s (כתוביות=%s, תיאור=%s)", job_id, url, want_subs, want_desc)
         path, clients, cookie_path, info = download_with_fallbacks(url, job_dir, extra_cookies)
         log.info("[%s] הורדה הושלמה: %s (%.1f MB)", job_id, os.path.basename(path),
                  os.path.getsize(path) / 1024 / 1024)
 
-        subs_state = "disabled"
-        srt_to_upload = None
-        if DOWNLOAD_SUBS and SUB_LANGS:
-            set_job(job_id, status="subtitles")
-            try:
-                files, reason = fetch_subtitles(url, job_dir, clients, cookie_path)
-            except Exception as e:  # כתוביות לעולם לא מפילות את המשימה
-                log.warning("[%s] כשל לא צפוי בכתוביות: %s", job_id, e)
-                files, reason = [], "failed"
-            if files:
-                chosen = pick_sub(files)
-                if embed_subtitles(path, chosen):
-                    subs_state = "embedded"
-                    srt_to_upload = chosen if UPLOAD_SRT else None
-                else:
-                    subs_state = "separate_only"
-                    srt_to_upload = chosen
-            else:
-                subs_state = reason  # unavailable / rate_limited / failed
-            log.info("[%s] מצב כתוביות: %s", job_id, subs_state)
+        # ---- שלב 1: הסרטון עולה לדרייב לפני כל דבר אחר ----
+        set_job(job_id, status="uploading", filename=os.path.basename(path))
+        file_id = upload_to_drive(path)
+        set_job(job_id, status="video_uploaded", drive_file_id=file_id, video_uploaded=True)
+        log.info("[%s] הסרטון הועלה ל-Drive: %s", job_id, file_id)
 
-        desc_path, desc_state = None, "disabled"
-        if UPLOAD_DESCRIPTION:
+        # ---- שלב 2: תיאור ----
+        if want_desc:
+            set_job(job_id, status="description")
+            state = "failed"
             try:
                 desc_path = write_description_file(info, path)
-                desc_state = "uploaded" if desc_path else "empty"
-            except Exception as e:  # תיאור לעולם לא מפיל את המשימה
-                log.warning("[%s] יצירת קובץ התיאור נכשלה: %s", job_id, e)
-                desc_state = "failed"
+                if desc_path:
+                    upload_to_drive(desc_path)
+                    state = "uploaded"
+                else:
+                    state = "empty"
+            except Exception as e:
+                log.warning("[%s] התיאור נכשל: %s", job_id, e)
+            set_job(job_id, description=state)
 
-        set_job(job_id, status="uploading", filename=os.path.basename(path),
-                subtitles=subs_state, description=desc_state)
-        file_id = upload_to_drive(path)
-        if srt_to_upload:
+        # ---- שלב 3: כתוביות ----
+        if want_subs:
+            set_job(job_id, status="subtitles")
+            state = "failed"
             try:
-                upload_to_drive(srt_to_upload)
+                files, reason = fetch_subtitles(url, job_dir, clients, cookie_path)
+                if files:
+                    chosen = pick_sub(files)
+                    try:
+                        upload_to_drive(chosen)
+                        state = "uploaded"
+                    except Exception as e:
+                        log.warning("[%s] העלאת קובץ הכתוביות נכשלה: %s", job_id, e)
+                        state = "upload_failed"
+                    # אופציונלי: הטמעה בתוך הסרטון שכבר בדרייב (מעלה אותו שוב, לכן כבוי כברירת מחדל)
+                    if EMBED_SUBS and state == "uploaded" and embed_subtitles(path, chosen):
+                        try:
+                            update_drive_file(file_id, path)
+                            state = "embedded"
+                        except Exception as e:
+                            log.warning("[%s] עדכון הסרטון עם כתוביות מוטמעות נכשל: %s", job_id, e)
+                else:
+                    state = reason  # unavailable / rate_limited / failed
             except Exception as e:
-                log.warning("[%s] העלאת srt נכשלה: %s", job_id, e)
-        if desc_path:
-            try:
-                upload_to_drive(desc_path)
-            except Exception as e:
-                log.warning("[%s] העלאת קובץ התיאור נכשלה: %s", job_id, e)
-                set_job(job_id, description="failed")
-        set_job(job_id, status="done", drive_file_id=file_id)
-        log.info("[%s] הועלה ל-Drive: %s", job_id, file_id)
-    except HttpError as e:
-        log.error("[%s] שגיאת Google Drive: %s", job_id, e)
-        set_job(job_id, status="error", error=f"Drive: {e}")
+                log.warning("[%s] כשל בכתוביות: %s", job_id, e)
+            set_job(job_id, subtitles=state)
+            log.info("[%s] מצב כתוביות: %s", job_id, state)
+
+        set_job(job_id, status="done")
+        log.info("[%s] הסתיים.", job_id)
     except Exception as e:
         log.error("[%s] שגיאה: %s", job_id, e)
         log.error(traceback.format_exc())
-        set_job(job_id, status="error", error=str(e)[:500])
+        with jobs_lock:
+            uploaded = jobs.get(job_id, {}).get("video_uploaded")
+        msg = f"Drive: {e}" if isinstance(e, HttpError) else str(e)
+        if uploaded:  # הסרטון כבר בדרייב: זו שגיאה בשלב המשני, לא כישלון המשימה
+            set_job(job_id, status="done", extras_error=msg[:300])
+        else:
+            set_job(job_id, status="error", error=msg[:500])
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        notify_callback(job_id)
+
+
+# ---------------------------------------------------------------------------
+# סריקת דף אינטרנט, בחירה והעלאה (ממשק /ui) + הורדה כללית עם yt-dlp
+# ---------------------------------------------------------------------------
+def public_url_error(url):
+    """הגנת SSRF: מחזיר הודעת שגיאה אם הכתובת אינה http(s) ציבורית, אחרת None."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return "הכתובת חייבת להתחיל ב-http:// או https://"
+        if p.username or p.password:
+            return "כתובת עם שם משתמש/סיסמה אינה נתמכת."
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+        for info in infos:
+            if not ipaddress.ip_address(info[4][0]).is_global:
+                return "כתובת פנימית/פרטית אסורה."
+    except socket.gaierror:
+        return "לא ניתן לאתר את הדומיין."
+    except ValueError:
+        return "כתובת לא תקינה."
+    return None
+
+
+def generic_guard():
+    """סריקה/בדיקה/הורדה כללית מחייבות API_KEY מוגדר (כי השרת מבקש כתובות בשם המשתמש)."""
+    if not GENERIC_ENABLED:
+        return jsonify({"error": "הפעולה כבויה (ALLOW_GENERIC=0)."}), 403
+    if not API_KEY:
+        return jsonify({"error": "הגדר API_KEY ב-Railway כדי להפעיל סריקת דפים."}), 403
+    if not authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+
+def _generic_proxies():
+    return {"http": GENERIC_PROXY, "https": GENERIC_PROXY} if GENERIC_PROXY else None
+
+
+def fetch_page(url):
+    """טוען דף HTML (עד 3MB), עם בדיקת SSRF בכל הפניה. מחזיר (כתובת סופית, טקסט)."""
+    cur = url
+    for _ in range(6):
+        err = public_url_error(cur)
+        if err:
+            raise ValueError(err)
+        r = requests.get(cur, headers=SCAN_HEADERS, timeout=(10, 25), stream=True,
+                         allow_redirects=False, proxies=_generic_proxies())
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+            cur = urljoin(cur, r.headers["Location"])
+            r.close()
+            continue
+        r.raise_for_status()
+        body = bytearray()
+        for chunk in r.iter_content(65536):
+            body += chunk
+            if len(body) > 3 * 1024 * 1024:
+                break
+        r.close()
+        enc = r.encoding if (r.encoding and r.encoding.lower() != "iso-8859-1") else "utf-8"
+        return cur, body.decode(enc, errors="replace")
+    raise ValueError("יותר מדי הפניות.")
+
+
+def _youtube_id(url):
+    try:
+        u = urlparse(url)
+    except Exception:
+        return None
+    h = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.")
+    if h == "youtu.be":
+        vid = u.path.lstrip("/").split("/")[0]
+    elif h in ("youtube.com", "music.youtube.com", "youtube-nocookie.com"):
+        if u.path == "/watch":
+            vid = dict(kv.split("=", 1) for kv in u.query.split("&") if "=" in kv).get("v", "")
+        else:
+            m = re.match(r"^/(?:shorts|embed|live|v)/([\w-]{11})", u.path)
+            vid = m.group(1) if m else ""
+    else:
+        return None
+    return vid if re.fullmatch(r"[\w-]{11}", vid or "") else None
+
+
+def classify_link(url):
+    """מחזיר (type, canonical_url) או None. type: youtube/drive/mega/direct/page."""
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return None
+    vid = _youtube_id(url)
+    if vid:
+        return "youtube", f"https://www.youtube.com/watch?v={vid}"
+    ref = parse_drive_link(url)
+    if ref:
+        return "drive", f"https://drive.google.com/file/d/{ref[0]}/view" + (f"?resourcekey={ref[1]}" if ref[1] else "")
+    mega = parse_mega_link(url)
+    if mega:
+        return "mega", mega
+    clean = url.split("#", 1)[0]
+    path = urlparse(clean).path.lower()
+    if path.endswith(VIDEO_EXTS + (".m3u8", ".mpd")):
+        return "direct", clean
+    if path.endswith(STATIC_EXTS):
+        return None
+    return "page", clean
+
+
+class _PageParser(HTMLParser):
+    def __init__(self, base):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.found = []          # (url, text, source)
+        self.title = ""
+        self.og_title = ""
+        self._in_title = False
+        self._a = None
+        self._ld = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "title":
+            self._in_title = True
+        elif tag == "a" and a.get("href"):
+            self._a = {"href": urljoin(self.base, a["href"]), "text": "",
+                       "hint": a.get("title") or a.get("aria-label") or ""}
+        elif tag == "img" and self._a is not None and a.get("alt") and not self._a["hint"]:
+            self._a["hint"] = a["alt"]
+        elif tag in ("video", "source", "audio") and a.get("src"):
+            self.found.append((urljoin(self.base, a["src"]), a.get("title", ""), "video-tag"))
+        elif tag in ("iframe", "embed") and a.get("src"):
+            self.found.append((urljoin(self.base, a["src"]), a.get("title", ""), "embed"))
+        elif tag == "meta":
+            prop = (a.get("property") or a.get("name") or "").lower()
+            content = a.get("content", "")
+            if prop in ("og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream") and content:
+                self.found.append((urljoin(self.base, content), "", "meta"))
+            elif prop == "og:title":
+                self.og_title = content
+        elif tag == "script" and a.get("type", "").lower() == "application/ld+json":
+            self._ld = []
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+        elif tag == "a" and self._a is not None:
+            text = re.sub(r"\s+", " ", self._a["text"]).strip() or self._a["hint"]
+            self.found.append((self._a["href"], text, "link"))
+            self._a = None
+        elif tag == "script" and self._ld is not None:
+            raw, self._ld = "".join(self._ld), None
+            try:
+                self._walk_ld(json.loads(raw))
+            except Exception:
+                pass
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        if self._a is not None:
+            self._a["text"] += data
+        if self._ld is not None:
+            self._ld.append(data)
+
+    def _walk_ld(self, node):
+        if isinstance(node, list):
+            for n in node:
+                self._walk_ld(n)
+        elif isinstance(node, dict):
+            t = node.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if any(isinstance(x, str) and "video" in x.lower() for x in types):
+                for k in ("contentUrl", "embedUrl", "url"):
+                    if isinstance(node.get(k), str):
+                        self.found.append((urljoin(self.base, node[k]), str(node.get("name") or ""), "json-ld"))
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    self._walk_ld(v)
+
+
+_MEDIA_RE = re.compile(r"https?:(?:\\?/){2}[^\"'\s<>]+?\.(?:mp4|m3u8|webm|mov|mkv|mpd)(?:\?[^\"'\s<>\\]*)?", re.I)
+
+
+def scan_page(url, limit=500):
+    final_url, html = fetch_page(url)
+    parser = _PageParser(final_url)
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as e:
+        log.warning("ניתוח HTML נכשל חלקית: %s", e)
+
+    found = list(parser.found)
+    for m in _MEDIA_RE.findall(html):                       # קישורי מדיה שמוטמעים בתוך JSON/סקריפטים
+        found.append((m.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&"), "", "script"))
+
+    site = (urlparse(final_url).hostname or "").lower().removeprefix("www.")
+    items, seen = [], {}
+    for raw_url, text, source in found:
+        cls = classify_link(raw_url.strip())
+        if not cls:
+            continue
+        kind, canon = cls
+        title = re.sub(r"\s+", " ", text or "").strip()[:150]
+        if canon in seen:
+            if not seen[canon]["title"] and title:
+                seen[canon]["title"] = title
+            continue
+        host = (urlparse(canon).hostname or "").lower().removeprefix("www.")
+        if kind == "page":
+            if canon.rstrip("/") == final_url.split("#", 1)[0].rstrip("/") or SOCIAL_RE.search(host):
+                continue
+            likely = bool(LIKELY_VIDEO_RE.search((urlparse(canon).path + " " + title).lower()))
+        else:
+            likely = True
+        item = {"url": canon, "title": title, "type": kind, "likely": likely,
+                "same_site": host == site or host.endswith("." + site), "source": source}
+        seen[canon] = item
+        items.append(item)
+        if len(items) >= limit:
+            break
+
+    order = {"youtube": 0, "drive": 0, "mega": 0, "direct": 1, "page": 2}
+    items.sort(key=lambda i: (order[i["type"]], not i["likely"]))
+    return {"page_url": final_url, "title": (parser.og_title or parser.title).strip()[:200],
+            "count": len(items), "items": items}
+
+
+def probe_url(url):
+    """בודק עם yt-dlp (בלי להוריד) אם אפשר להוריד את הכתובת. מחזיר dict עם ok/title/duration/error."""
+    err = public_url_error(url)
+    if err:
+        return {"ok": False, "error": err}
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+            "socket_timeout": 20, "retries": 2, "cachedir": "/tmp/yt-dlp-cache", "logger": CaptureLogger()}
+    if GENERIC_PROXY:
+        opts["proxy"] = GENERIC_PROXY
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        formats = info.get("formats") or []
+        return {"ok": True, "title": info.get("title") or "", "duration": info.get("duration"),
+                "playlist": info.get("_type") == "playlist",
+                "drm": bool(formats) and all(f.get("has_drm") for f in formats)}
+    except DownloadError as e:
+        return {"ok": False, "error": explain_generic_error(str(e))}
+
+
+def explain_generic_error(msg):
+    low = msg.lower()
+    if "drm" in low:
+        return "הסרטון מוגן DRM ולא ניתן להורדה."
+    if "geo" in low or "your country" in low or "not available in your" in low:
+        return "הסרטון חסום לפי מיקום (ה-IP של השרת). ייתכן שנדרש פרוקסי (GENERIC_PROXY) במדינה המתאימה."
+    if "unsupported url" in low:
+        return "yt-dlp לא מזהה וידאו בכתובת הזו (ייתכן שהסרטון נטען רק בדפדפן)."
+    if "403" in low or "forbidden" in low:
+        return "האתר חוסם את השרת (403)."
+    return re.sub(r"\x1b\[[0-9;]*m", "", msg).replace("ERROR: ", "")[:250]
+
+
+def process_generic(job_id, url, want_desc=None):
+    """הורדה מכל אתר ש-yt-dlp תומך בו (או קישור ישיר לקובץ), והעלאה לדרייב."""
+    want_desc = UPLOAD_DESCRIPTION if want_desc is None else bool(want_desc)
+    job_dir = os.path.join(WORK_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        set_job(job_id, status="downloading", description="pending" if want_desc else "disabled")
+        err = public_url_error(url)
+        if err:
+            raise RuntimeError(err)
+        opts = build_ydl_opts(job_dir, None, None, CaptureLogger())
+        opts.pop("proxy", None)                      # פרוקסי היוטיוב לא רלוונטי לאתרים אחרים
+        if GENERIC_PROXY:
+            opts["proxy"] = GENERIC_PROXY
+        log.info("[%s] הורדה כללית: %s", job_id, url)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except DownloadError as e:
+            raise RuntimeError(explain_generic_error(str(e)))
+        path = find_output_file(info, job_dir)
+        if not path:
+            raise RuntimeError("ההורדה הסתיימה אך לא נמצא קובץ.")
+        log.info("[%s] הורדה הושלמה: %s (%.1f MB)", job_id, os.path.basename(path),
+                 os.path.getsize(path) / 1024 / 1024)
+
+        set_job(job_id, status="uploading", filename=os.path.basename(path))
+        file_id = upload_to_drive(path)
+        set_job(job_id, status="video_uploaded", drive_file_id=file_id, video_uploaded=True)
+
+        if want_desc:
+            state = "failed"
+            try:
+                dp = write_description_file(info, path)
+                if dp:
+                    upload_to_drive(dp)
+                    state = "uploaded"
+                else:
+                    state = "empty"
+            except Exception as e:
+                log.warning("[%s] התיאור נכשל: %s", job_id, e)
+            set_job(job_id, description=state)
+        set_job(job_id, status="done")
+    except Exception as e:
+        log.error("[%s] שגיאה: %s", job_id, e)
+        with jobs_lock:
+            uploaded = jobs.get(job_id, {}).get("video_uploaded")
+        msg = f"Drive: {e}" if isinstance(e, HttpError) else str(e)
+        if uploaded:
+            set_job(job_id, status="done", extras_error=msg[:300])
+        else:
+            set_job(job_id, status="error", error=msg[:500])
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
         notify_callback(job_id)
@@ -862,6 +1331,7 @@ def health_check():
         "subtitles": DOWNLOAD_SUBS,
         "description": UPLOAD_DESCRIPTION,
         "mega": bool(shutil.which("megadl")),
+        "auth_required": bool(API_KEY),
     }), 200
 
 
@@ -879,9 +1349,18 @@ def download_video():
     is_youtube = valid_youtube_url(url)
     if mega_host(url) and not mega_url:
         return jsonify({"error": "MEGA: only single-file links with a key (mega.nz/file/ID#KEY) are supported"}), 400
+    use_generic = False
     if not is_youtube and not drive_ref and not mega_url:
-        return jsonify({"error": "Only YouTube, Google Drive or MEGA file URLs are allowed"}), 400
-    source = "youtube" if is_youtube else "mega" if mega_url else "drive"
+        if not parse_flag(data.get("generic"), False):
+            return jsonify({"error": "Only YouTube, Google Drive or MEGA file URLs are allowed"}), 400
+        blocked = generic_guard()
+        if blocked:
+            return blocked
+        why = public_url_error(url)
+        if why:
+            return jsonify({"error": why}), 400
+        use_generic = True
+    source = "youtube" if is_youtube else "mega" if mega_url else "generic" if use_generic else "drive"
 
     extra_cookies = None
     if is_youtube:
@@ -891,6 +1370,10 @@ def download_video():
         else:
             log.warning("הבקשה הגיעה בלי קוקיז - בדוק שב-Make מועבר השדה cookies.")
 
+    opts = data.get("options") if isinstance(data.get("options"), dict) else {}
+    want_subs = parse_flag(opts.get("subtitles"), DOWNLOAD_SUBS)
+    want_desc = parse_flag(opts.get("description"), UPLOAD_DESCRIPTION)
+
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         if len(jobs) >= MAX_JOBS_KEPT:
@@ -899,12 +1382,56 @@ def download_video():
         jobs[job_id] = {"status": "queued", "url": redact_url(url), "source": source}
 
     if is_youtube:
-        executor.submit(process_and_upload, job_id, url, extra_cookies)
+        executor.submit(process_and_upload, job_id, url, extra_cookies, want_subs, want_desc)
     elif mega_url:
         executor.submit(process_mega, job_id, mega_url)
+    elif use_generic:
+        executor.submit(process_generic, job_id, url, want_desc)
     else:
         executor.submit(process_drive_copy, job_id, drive_ref)
     return jsonify({"status": "success", "message": "הבקשה התקבלה!", "job_id": job_id}), 202
+
+
+@app.route("/ui", methods=["GET"])
+def ui_page():
+    try:
+        with open(UI_PATH, encoding="utf-8") as f:
+            html = f.read()
+    except OSError:
+        return "ui.html לא נמצא בשרת", 500
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/scan", methods=["POST"])
+def scan_route():
+    blocked = generic_guard()
+    if blocked:
+        return blocked
+    url = ((request.get_json(silent=True) or {}).get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "לא התקבלה כתובת."}), 400
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        return jsonify(scan_page(url)), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except requests.RequestException as e:
+        return jsonify({"error": f"טעינת הדף נכשלה: {str(e)[:200]}"}), 502
+    except Exception as e:
+        log.error("scan נכשל: %s", traceback.format_exc())
+        return jsonify({"error": f"שגיאה בסריקה: {str(e)[:200]}"}), 500
+
+
+@app.route("/probe", methods=["POST"])
+def probe_route():
+    blocked = generic_guard()
+    if blocked:
+        return blocked
+    url = ((request.get_json(silent=True) or {}).get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "לא התקבלה כתובת."}), 400
+    return jsonify(probe_url(url)), 200
 
 
 @app.route("/status/<job_id>", methods=["GET"])

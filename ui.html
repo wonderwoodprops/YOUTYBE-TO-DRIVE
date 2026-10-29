@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>סריקת דף והעלאה לדרייב</title>
+<style>
+  :root { --bg:#f5f7fb; --card:#fff; --text:#1d2433; --muted:#6b7385; --line:#e3e7ef; --primary:#1a73e8; --primary-d:#1558b8;
+          --yt:#d93025; --drive:#188038; --mega:#c2570a; --direct:#7b3fb5; --page:#5f6b7a; --ok:#188038; --err:#d93025; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151922; --card:#1f2430; --text:#e8ecf5; --muted:#98a1b5; --line:#2e3544; --primary:#6ea8fe; --primary-d:#8bb9ff;
+            --yt:#ff7b72; --drive:#5fd68a; --mega:#ffb86b; --direct:#c9a0ff; --page:#a3adbd; --ok:#5fd68a; --err:#ff7b72; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,"Segoe UI",Arial,sans-serif; }
+  header { padding:16px 20px; background:linear-gradient(135deg,#d93025,#1a73e8); color:#fff; }
+  header h1 { margin:0; font-size:20px; } header p { margin:2px 0 0; opacity:.9; font-size:13px; }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin-bottom:14px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input[type=text], input[type=password], input[type=search] { flex:1; min-width:160px; padding:9px 11px; border:1px solid var(--line);
+    border-radius:8px; background:var(--card); color:var(--text); font:inherit; direction:ltr; text-align:left; }
+  input:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 2px #1a73e833; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--primary); color:var(--primary); }
+  button:disabled { opacity:.5; cursor:default; }
+  button.primary { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:600; }
+  button.primary:hover:not(:disabled) { background:var(--primary-d); color:#fff; }
+  .muted { color:var(--muted); font-size:13px; }
+  .msg { padding:8px 10px; border-radius:8px; margin-top:10px; background:color-mix(in srgb,var(--primary) 10%,var(--card)); }
+  .msg.err { background:color-mix(in srgb,var(--err) 13%,var(--card)); }
+  #list { max-height:56vh; overflow-y:auto; border:1px solid var(--line); border-radius:10px; }
+  .item { display:flex; gap:10px; padding:9px 10px; border-bottom:1px solid var(--line); align-items:flex-start; }
+  .item:last-child { border-bottom:0; }
+  .item input { margin-top:4px; width:16px; height:16px; accent-color:var(--primary); flex:none; }
+  .body { flex:1; min-width:0; }
+  .title { font-weight:600; word-break:break-word; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .url { direction:ltr; text-align:left; font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .badge { font-size:11px; font-weight:700; padding:1px 7px; border-radius:99px; border:1px solid currentColor; flex:none; }
+  .b-youtube{color:var(--yt)} .b-drive{color:var(--drive)} .b-mega{color:var(--mega)} .b-direct{color:var(--direct)} .b-page{color:var(--page)}
+  .probe { font-size:12px; margin-top:3px; } .probe.ok{color:var(--ok)} .probe.bad{color:var(--err)}
+  .small { padding:2px 9px; font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; } td,th { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); }
+  label.chk { display:flex; gap:6px; align-items:center; cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>סריקת דף והעלאה לדרייב</h1>
+  <p>הדבק כתובת של דף, בחר אילו סרטונים להעלות, והשרת מעלה אותם לדרייב שלך</p>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <label for="key">מפתח API:</label>
+      <input type="password" id="key" placeholder="הערך של API_KEY מ-Railway" autocomplete="off">
+      <button id="saveKey">שמור לסשן</button>
+    </div>
+    <div class="muted" id="authNote" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input type="text" id="url" placeholder="https://www.mako.co.il/">
+      <button class="primary" id="scan">סרוק דף</button>
+    </div>
+    <div id="scanMsg"></div>
+  </div>
+
+  <div class="card" id="results" hidden>
+    <div class="row" style="margin-bottom:8px">
+      <input type="search" id="filter" placeholder="סינון לפי כותרת או כתובת..." style="direction:rtl;text-align:right">
+      <label class="chk"><input type="checkbox" id="onlyLikely" checked> רק פריטים שנראים כווידאו</label>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <button id="selAll">בחר את המוצגים</button>
+      <button id="selNone">נקה בחירה</button>
+      <span class="muted" id="count"></span>
+    </div>
+    <div id="list"></div>
+    <div class="row" style="margin-top:12px">
+      <label class="chk"><input type="checkbox" id="optDesc" checked> שמור תיאור כקובץ טקסט</label>
+      <label class="chk"><input type="checkbox" id="optSubs" checked> כתוביות בעברית (יוטיוב בלבד)</label>
+      <span style="flex:1"></span>
+      <button class="primary" id="send" disabled>העלה לדרייב</button>
+    </div>
+    <div class="muted" style="margin-top:6px">הסרטון עולה לדרייב קודם, ורק אחריו מטופלים התיאור והכתוביות.</div>
+  </div>
+
+  <div class="card" id="jobsCard" hidden>
+    <b>מצב העלאות</b>
+    <table id="jobs"><thead><tr><th>פריט</th><th>מצב</th><th>פרטים</th></tr></thead><tbody></tbody></table>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TYPE = { youtube: "YouTube", drive: "Drive", mega: "MEGA", direct: "קובץ וידאו", page: "דף" };
+const STATUS = { queued: "בתור", downloading: "מוריד", uploading: "מעלה לדרייב", video_uploaded: "הסרטון בדרייב",
+                 description: "שומר תיאור", subtitles: "כתוביות", copying: "מעתיק", done: "הסתיים", error: "שגיאה" };
+let items = [];
+let jobs = [];
+let timer = null;
+
+const getKey = () => { try { return sessionStorage.getItem("apikey") || ""; } catch (_) { return ""; } };
+function headers(json) {
+  const h = { "X-API-Key": getKey() };
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+async function call(path, body) {
+  const r = await fetch(path, body === undefined ? { headers: headers() }
+                                                 : { method: "POST", headers: headers(true), body: JSON.stringify(body) });
+  let data = {};
+  try { data = await r.json(); } catch (_) {}
+  if (!r.ok) throw new Error(data.error || ("שגיאה " + r.status));
+  return data;
+}
+function note(el, text, err) {
+  el.textContent = "";
+  if (!text) return;
+  const d = document.createElement("div");
+  d.className = "msg" + (err ? " err" : "");
+  d.textContent = text;
+  el.appendChild(d);
+}
+
+// ---------- מפתח ----------
+$("key").value = getKey();
+$("saveKey").onclick = () => { try { sessionStorage.setItem("apikey", $("key").value.trim()); } catch (_) {} $("authNote").textContent = "נשמר לסשן הזה בלבד."; };
+fetch("/").then((r) => r.json()).then((h) => {
+  if (!h.auth_required) $("authNote").textContent = "שים לב: API_KEY לא מוגדר בשרת, ולכן סריקת דפים מושבתת. הגדר אותו ב-Railway.";
+}).catch(() => {});
+
+// ---------- סריקה ----------
+$("scan").onclick = async () => {
+  const url = $("url").value.trim();
+  if (!url) return;
+  $("scan").disabled = true;
+  note($("scanMsg"), "סורק...");
+  try {
+    const res = await call("/scan", { url });
+    items = res.items.map((i) => ({ ...i, checked: false, probe: null }));
+    note($("scanMsg"), `${res.title ? res.title + " · " : ""}נמצאו ${res.count} קישורים.`);
+    $("results").hidden = false;
+    render();
+  } catch (e) {
+    note($("scanMsg"), e.message, true);
+  } finally {
+    $("scan").disabled = false;
+  }
+};
+$("url").addEventListener("keydown", (e) => { if (e.key === "Enter") $("scan").click(); });
+
+function visible() {
+  const q = $("filter").value.trim().toLowerCase();
+  const only = $("onlyLikely").checked;
+  return items.filter((i) => (!only || i.likely) &&
+    (!q || (i.title || "").toLowerCase().includes(q) || i.url.toLowerCase().includes(q)));
+}
+
+function render() {
+  const list = $("list");
+  list.textContent = "";
+  const vis = visible();
+  if (!vis.length) {
+    const d = document.createElement("div");
+    d.className = "muted";
+    d.style.padding = "14px";
+    d.textContent = items.length ? "אין תוצאות לסינון (נסה לבטל את \"רק פריטים שנראים כווידאו\")." : "לא נמצאו קישורים.";
+    list.appendChild(d);
+  }
+  for (const it of vis) {
+    const row = document.createElement("div");
+    row.className = "item";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = it.checked;
+    cb.onchange = () => { it.checked = cb.checked; updateCount(); };
+
+    const body = document.createElement("div");
+    body.className = "body";
+    const title = document.createElement("div");
+    title.className = "title";
+    const badge = document.createElement("span");
+    badge.className = "badge b-" + it.type;
+    badge.textContent = TYPE[it.type] || it.type;
+    const name = document.createElement("span");
+    name.textContent = it.title || it.url;
+    title.append(badge, name);
+    const url = document.createElement("div");
+    url.className = "url";
+    url.textContent = it.url.startsWith("https://mega.nz/") ? it.url.split("#")[0] + "#••••" : it.url;
+    body.append(title, url);
+
+    if (it.type === "page" || it.type === "direct") {
+      const btn = document.createElement("button");
+      btn.className = "small";
+      btn.textContent = "בדוק אם אפשר להוריד";
+      const out = document.createElement("div");
+      out.className = "probe";
+      const show = () => {
+        if (!it.probe) return;
+        out.className = "probe " + (it.probe.ok ? "ok" : "bad");
+        out.textContent = it.probe.ok
+          ? "אפשר להוריד: " + (it.probe.title || "") + (it.probe.duration ? " (" + Math.round(it.probe.duration / 60) + " דק')" : "") + (it.probe.drm ? " · DRM" : "")
+          : it.probe.error;
+      };
+      btn.onclick = async () => {
+        btn.disabled = true; out.className = "probe"; out.textContent = "בודק...";
+        try { it.probe = await call("/probe", { url: it.url }); } catch (e) { it.probe = { ok: false, error: e.message }; }
+        btn.disabled = false; show();
+      };
+      show();
+      body.append(btn, out);
+    }
+    row.append(cb, body);
+    list.appendChild(row);
+  }
+  updateCount();
+}
+
+function updateCount() {
+  const n = items.filter((i) => i.checked).length;
+  $("count").textContent = `מוצגים ${visible().length} מתוך ${items.length} · נבחרו ${n}`;
+  $("send").textContent = n ? `העלה לדרייב (${n})` : "העלה לדרייב";
+  $("send").disabled = n === 0;
+}
+$("filter").oninput = render;
+$("onlyLikely").onchange = render;
+$("selAll").onclick = () => { visible().forEach((i) => (i.checked = true)); render(); };
+$("selNone").onclick = () => { items.forEach((i) => (i.checked = false)); render(); };
+
+// ---------- שליחה ומעקב ----------
+$("send").onclick = async () => {
+  const chosen = items.filter((i) => i.checked);
+  if (!chosen.length) return;
+  $("send").disabled = true;
+  $("jobsCard").hidden = false;
+  for (const it of chosen) {
+    const body = { url: it.url, options: { subtitles: $("optSubs").checked, description: $("optDesc").checked } };
+    if (it.type === "page" || it.type === "direct") body.generic = true;
+    const job = { title: it.title || it.url, status: "queued", detail: "" };
+    jobs.push(job);
+    try {
+      const r = await call("/download", body);
+      job.id = r.job_id;
+      it.checked = false;
+    } catch (e) {
+      job.status = "error"; job.detail = e.message;
+    }
+    renderJobs();
+  }
+  render();
+  poll();
+};
+
+function renderJobs() {
+  const tb = $("jobs").querySelector("tbody");
+  tb.textContent = "";
+  for (const j of jobs) {
+    const tr = document.createElement("tr");
+    for (const text of [j.title, STATUS[j.status] || j.status, j.detail || ""]) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    if (j.status === "error") tr.style.color = "var(--err)";
+    tb.appendChild(tr);
+  }
+}
+
+async function poll() {
+  clearTimeout(timer);
+  let active = false;
+  for (const j of jobs) {
+    if (!j.id || j.status === "done" || j.status === "error") continue;
+    active = true;
+    try {
+      const s = await call("/status/" + j.id);
+      j.status = s.status;
+      const parts = [];
+      if (s.filename) parts.push(s.filename);
+      if (s.description && !["disabled", "pending"].includes(s.description)) parts.push("תיאור: " + s.description);
+      if (s.subtitles && !["disabled", "pending"].includes(s.subtitles)) parts.push("כתוביות: " + s.subtitles);
+      if (s.error) parts.push(s.error);
+      if (s.extras_error) parts.push(s.extras_error);
+      j.detail = parts.join(" · ");
+    } catch (e) { j.detail = e.message; }
+  }
+  renderJobs();
+  if (active) timer = setTimeout(poll, 4000);
+}
+</script>
+</body>
+</html>
